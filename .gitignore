@@ -1,0 +1,4 @@
+libcephfsd
+libcephfsd_test
+*.o
+*.so
