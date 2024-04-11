@@ -30,7 +30,6 @@ libcephfsd_test:	$(test_sources:.c=.o) libcephfs_proxy.so
 
 libcephfs_proxy.so:	$(lib_sources:.c=.so.o)
 			gcc $(CFLAGS) -fvisibility=hidden -shared -fPIC -o $@ $^
-			strip $@
 
 %.so.o:			%.c Makefile
 			gcc $(CFLAGS) -fvisibility=hidden -c -fPIC -o $@ $<
