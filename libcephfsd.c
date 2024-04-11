@@ -338,7 +338,7 @@ ptr_check(proxy_random_t *rnd, uint64_t value, void **pptr)
         __err; \
     })
 
-#if 1
+#if 0
 #define TRACE(_fmt, _args...) do { } while (0)
 #else
 #define TRACE(_fmt, _args...) printf(_fmt "\n", ## _args)
@@ -695,12 +695,12 @@ libcephfsd_ll_lookup_inode(proxy_client_t *client, proxy_req_t *req,
         ino = req->ll_lookup_inode.ino;
 
         err = ceph_ll_lookup_inode(cmount, ino, &inode);
-        TRACE("ceph_ll_lookup_inode(%p, %lu, %p) -> %d", cmount, ino.val, inode,
-              err);
-
         if (err >= 0) {
             err = ptr_checksum(&client->random, inode, &ans.inode);
         }
+
+        TRACE("ceph_ll_lookup_inode(%p, %lu, %p) -> %d", cmount, ino.val, inode,
+              err);
     }
 
     return CEPH_COMPLETE(client, err, ans);
@@ -719,11 +719,11 @@ libcephfsd_ll_lookup_root(proxy_client_t *client, proxy_req_t *req,
                     (void **)&cmount);
     if (err >= 0) {
         err = ceph_ll_lookup_root(cmount, &inode);
-        TRACE("ceph_ll_lookup_root(%p, %p) -> %d", cmount, inode, err);
-
         if (err >= 0) {
             err = ptr_checksum(&client->random, inode, &ans.inode);
         }
+
+        TRACE("ceph_ll_lookup_root(%p, %p) -> %d", cmount, inode, err);
     }
 
     return CEPH_COMPLETE(client, err, ans);
