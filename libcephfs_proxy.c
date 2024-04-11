@@ -5,6 +5,14 @@
 #include "proxy_helpers.h"
 #include "proxy_requests.h"
 
+typedef struct ceph_dentry {
+    struct ceph_dentry *next;
+    struct Inode *parent;
+    struct Inode *inode;
+    uint32_t len;
+    char name[];
+} ceph_dentry_t;
+
 struct Inode {
     struct ceph_statx stx;
     struct Inode *next;
@@ -104,8 +112,10 @@ proxy_check(struct ceph_mount_info *cmount, int32_t err, int32_t result)
 }
 
 #define INODE_HASH_TABLE_SIZE 65537
+#define DENTRY_HASH_TABLE_SIZE 65537
 
 static struct Inode *inode_table[INODE_HASH_TABLE_SIZE] = {};
+static ceph_dentry_t *dentry_table[DENTRY_HASH_TABLE_SIZE] = {};
 
 static struct Inode *
 inode_ref(struct Inode *inode)
@@ -254,6 +264,144 @@ inode_create_ino(struct ceph_mount_info *cmount, struct Inode **pinode,
     stx.stx_ino = ino;
 
     return inode_create(cmount, pinode, ceph_inode, &stx);
+}
+
+#define MURMUR_SCRAMBLE(_in, _h1, _h2, _c1, _c2, _shift1, _shift2, _mul, _val) \
+    ({ \
+        uint64_t __out = (_in); \
+        if (__out != 0) { \
+            __out *= _c1; \
+            __out = (__out << _shift1) | (__out >> ((64 - _shift1) & 63)); \
+            __out *= _c2; \
+        } \
+        __out ^= _h1; \
+        __out = (__out << _shift2) | (__out >> ((64 - _shift2) & 63)); \
+        __out += _h2; \
+        __out *= _mul; \
+        __out += _val; \
+        __out; \
+    })
+
+#define MURMUR_FMIX(_val) \
+    ({ \
+        _val ^= _val >> 33; \
+        _val *= 0xff51afd7ed558ccdULL; \
+        _val ^= _val >> 33; \
+        _val *= 0xc4ceb9fe1a85ec53ULL; \
+        _val ^= _val >> 33; \
+        _val; \
+    })
+
+/* Implementation of MurmurHash3 (x64/128) */
+static uint64_t
+murmurhash3_x64_64(const char *text, uint32_t len)
+{
+    const uint64_t *blocks;
+    uint64_t h1, h2, c1, c2, mask;
+    uint32_t i, count;
+
+    blocks = (const uint64_t *)text;
+    count = len / 16;
+
+    h1 = 0xd304bfad9d308087ULL;
+    h2 = 0x4542871a0afb8fe3ULL;
+
+    c1 = 0x87c37b91114253d5ULL;
+    c2 = 0x4cf5ad432745937fULL;
+
+    for (i = 0; i < count; i++) {
+        h1 = MURMUR_SCRAMBLE(*blocks++, h1, h2, c1, c2, 31, 27, 5, 0x52dce729);
+        h2 = MURMUR_SCRAMBLE(*blocks++, h2, h1, c2, c1, 33, 31, 5, 0x38495ab5);
+    }
+
+    h1 ^= len;
+    h2 ^= len;
+
+    mask = (1ULL << ((len & 7) * 8)) - 1ULL;
+    if ((len & 8) == 0) {
+        h1 = MURMUR_SCRAMBLE(*blocks & mask, h1, h2, c1, c2, 29, 0, 1, 0);
+        h2 += h1;
+    } else {
+        h1 = MURMUR_SCRAMBLE(*blocks++, h1, h2, c1, c2, 29, 0, 1, 0);
+        h2 = MURMUR_SCRAMBLE(*blocks & mask, h2, h1, c2, c1, 33, 0, 1, 0);
+    }
+
+    h1 = MURMUR_FMIX(h1);
+    h2 = MURMUR_FMIX(h2);
+
+    h1 += h2;
+    h2 += h1;
+
+    return h1 ^ h2;
+}
+
+static ceph_dentry_t *
+dentry_lookup(struct Inode *parent, const char *name)
+{
+    ceph_dentry_t *dentry;
+    uint64_t hash;
+    uint32_t len;
+
+    len = strlen(name) + 1;
+
+    hash = ptr_value(parent) ^ murmurhash3_x64_64(name, len);
+    hash %= DENTRY_HASH_TABLE_SIZE;
+    for (dentry = dentry_table[hash]; dentry != NULL; dentry = dentry->next) {
+        if ((dentry->parent == parent) && (dentry->len == len) &&
+            (memcmp(dentry->name, name, len) == 0)) {
+            return dentry;
+        }
+    }
+
+    return NULL;
+}
+
+static void
+dentry_destroy(struct ceph_mount_info *cmount, ceph_dentry_t *dentry)
+{
+    ceph_ll_put(cmount, dentry->inode);
+    ceph_ll_put(cmount, dentry->parent);
+    proxy_free(dentry);
+}
+
+static int32_t
+dentry_create(struct ceph_mount_info *cmount, struct Inode *parent,
+              struct Inode *inode, const char *name)
+{
+    ceph_dentry_t **pdentry, *dentry;
+    uint64_t hash;
+    uint32_t len;
+
+    len = strlen(name) + 1;
+    hash = ptr_value(parent) ^ murmurhash3_x64_64(name, len);
+    hash %= DENTRY_HASH_TABLE_SIZE;
+    for (pdentry = &dentry_table[hash]; (dentry = *pdentry) != NULL;
+         pdentry = &dentry->next) {
+        if ((dentry->parent == parent) && (dentry->len == len) &&
+            (memcmp(dentry->name, name, len) == 0)) {
+            if (dentry->inode != inode) {
+                ceph_ll_put(cmount, dentry->inode);
+                dentry->inode = inode_ref(inode);
+            }
+
+            return 0;
+        }
+    }
+
+    dentry = proxy_malloc(sizeof(ceph_dentry_t) + len);
+    if (dentry == NULL) {
+        return -ENOMEM;
+    }
+
+    dentry->parent = inode_ref(parent);
+    dentry->inode = inode_ref(inode);
+    dentry->len = len;
+    memcpy(dentry->name, name, len);
+
+    dentry->next = dentry_table[hash];
+    dentry_table[hash] = dentry;
+
+    return 0;
 }
 
 #define CEPH_RUN(_cmount, _op, _req, _ans) \
@@ -438,6 +586,9 @@ ceph_ll_create(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_CREATE, req, ans);
     if (err >= 0) {
         err = inode_create(cmount, outp, ans.inode, stx);
+        if (err >= 0) {
+            err = dentry_create(cmount, parent, *outp, name);
+        }
         /* TODO: leak of ans.fh in case of error */
         if (err >= 0) {
             *fhp = value_ptr(ans.fh);
@@ -523,13 +674,19 @@ ceph_ll_link(struct ceph_mount_info *cmount, struct Inode *in,
              struct Inode *newparent, const char *name, const UserPerm *perms)
 {
     CEPH_REQ(ceph_ll_link, req, 1, ans, 0);
+    int32_t err;
 
     req.userperm = ptr_value(perms);
     req.inode = in->inode;
     req.parent = newparent->inode;
     CEPH_STR_ADD(req, name, name);
 
-    return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LINK, req, ans);
+    err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LINK, req, ans);
+    if (err >= 0) {
+        err = dentry_create(cmount, newparent, in, name);
+    }
+
+    return err;
 }
 
 __public int
@@ -559,15 +716,22 @@ ceph_ll_lookup(struct ceph_mount_info *cmount, Inode *parent, const char *name,
                unsigned flags, const UserPerm *perms)
 {
     CEPH_REQ(ceph_ll_lookup, req, 1, ans, 1);
+    ceph_dentry_t *dentry;
     int32_t err;
 
     if ((*name == '.') && (name[1] == 0)) {
-        if (cmount->cwd_inode != NULL) {
-            *out = inode_ref(cmount->cwd_inode);
-            memcpy(stx, &cmount->cwd_inode->stx, sizeof(*stx));
+        *out = inode_ref(parent);
+        memcpy(stx, &parent->stx, sizeof(*stx));
 
-            return 0;
-        }
+        return 0;
+    }
+
+    dentry = dentry_lookup(parent, name);
+    if (dentry != NULL) {
+        *out = inode_ref(dentry->inode);
+        memcpy(stx, &dentry->inode->stx, sizeof(*stx));
+
+        return 0;
     }
 
     req.userperm = ptr_value(perms);
@@ -581,6 +745,9 @@ ceph_ll_lookup(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LOOKUP, req, ans);
     if (err >= 0) {
         err = inode_create(cmount, out, ans.inode, stx);
+        if (err >= 0) {
+            err = dentry_create(cmount, parent, *out, name);
+        }
         if (err >= 0) {
             if ((*name == '.') && (name[1] == 0)) {
                 cmount->cwd_inode = inode_ref(*out);
@@ -699,6 +866,9 @@ ceph_ll_mkdir(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_MKDIR, req, ans);
     if (err >= 0) {
         err = inode_create(cmount, out, ans.inode, stx);
+        if (err >= 0) {
+            err = dentry_create(cmount, parent, *out, name);
+        }
     }
 
     return err;
@@ -725,6 +895,9 @@ ceph_ll_mknod(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_MKNOD, req, ans);
     if (err >= 0) {
         err = inode_create(cmount, out, ans.inode, stx);
+        if (err >= 0) {
+            err = dentry_create(cmount, parent, *out, name);
+        }
     }
 
     return err;
@@ -951,6 +1124,9 @@ ceph_ll_symlink(struct ceph_mount_info *cmount, Inode *in, const char *name,
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_SYMLINK, req, ans);
     if (err >= 0) {
         err = inode_create(cmount, out, ans.inode, stx);
+        if (err >= 0) {
+            err = dentry_create(cmount, in, *out, name);
+        }
     }
 
     return err;
