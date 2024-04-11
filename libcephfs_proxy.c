@@ -150,9 +150,10 @@ static struct Inode *
 inode_lookup(uint64_t ino)
 {
     struct Inode *inode;
+    uint64_t hash;
 
-    ino %= INODE_HASH_TABLE_SIZE;
-    for (inode = inode_table[ino]; inode != NULL; inode = inode->next) {
+    hash = ino % INODE_HASH_TABLE_SIZE;
+    for (inode = inode_table[hash]; inode != NULL; inode = inode->next) {
         if (inode->stx.stx_ino == ino) {
             return inode_ref(inode);
         }
