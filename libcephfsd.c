@@ -583,12 +583,29 @@ libcephfsd_unmount(proxy_client_t *client, proxy_req_t *req, const void *data,
 {
     CEPH_DATA(ceph_unmount, ans, 0);
     struct ceph_mount_info *cmount;
+    struct Inode *root_inode, *cwd_inode;
     int32_t err;
 
     err = ptr_check(&client->random, req->unmount.cmount, (void **)&cmount);
+    if (err >= 0) {
+        err = ptr_check(&client->random, req->unmount.root_inode,
+                        (void **)&root_inode);
+    }
+    if (err >= 0) {
+        err = ptr_check(&client->random, req->unmount.cwd_inode,
+                        (void **)&cwd_inode);
+    }
 
     if (err >= 0) {
-        err = ceph_unmount(cmount);
+        if (root_inode != NULL) {
+            err = ceph_ll_put(cmount, root_inode);
+        }
+        if ((err >= 0) && (cwd_inode != NULL)) {
+            err = ceph_ll_put(cmount, cwd_inode);
+        }
+        if (err >= 0) {
+            err = ceph_unmount(cmount);
+        }
         TRACE("ceph_unmount(%p) -> %d", cmount, err);
     }
 
@@ -774,8 +791,9 @@ static int32_t
 libcephfsd_chdir(proxy_client_t *client, proxy_req_t *req, const void *data,
                  int32_t data_size)
 {
-    CEPH_DATA(ceph_chdir, ans, 0);
+    CEPH_DATA(ceph_chdir, ans, 1);
     struct ceph_mount_info *cmount;
+    struct Inode *inode;
     const char *path;
     int32_t err;
 
@@ -784,6 +802,18 @@ libcephfsd_chdir(proxy_client_t *client, proxy_req_t *req, const void *data,
         path = CEPH_STR_GET(req->chdir, path, data);
 
         err = ceph_chdir(cmount, path);
+        if (err >= 0) {
+            if (req->chdir.inode != 0) {
+                err = ptr_check(&client->random, req->chdir.inode,
+                                (void **)&inode);
+                if (err >= 0) {
+                    ceph_ll_put(cmount, inode);
+                }
+            }
+
+            path = ceph_getcwd(cmount);
+            CEPH_BUFF_ADD(ans, path, strlen(path) + 1);
+        }
         TRACE("ceph_chdir(%p, '%s') -> %d", cmount, path, err);
     }
 

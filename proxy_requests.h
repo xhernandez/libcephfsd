@@ -181,7 +181,13 @@ CEPH_TYPE(ceph_select_filesystem, REQ_CMOUNT(uint16_t fs;), ANS());
 
 CEPH_TYPE(ceph_mount, REQ_CMOUNT(uint16_t root;), ANS());
 
-CEPH_TYPE(ceph_unmount, REQ_CMOUNT(), ANS());
+CEPH_TYPE(ceph_unmount,
+    REQ_CMOUNT(
+        uint64_t root_inode;
+        uint64_t cwd_inode;
+    ),
+    ANS()
+);
 
 CEPH_TYPE(ceph_ll_statfs, REQ_CMOUNT(uint64_t inode;), ANS());
 
@@ -223,7 +229,13 @@ CEPH_TYPE(ceph_ll_walk,
     )
 );
 
-CEPH_TYPE(ceph_chdir, REQ_CMOUNT(uint16_t path;), ANS());
+CEPH_TYPE(ceph_chdir,
+    REQ_CMOUNT(
+        uint64_t inode;
+        uint16_t path;
+    ),
+    ANS()
+);
 
 CEPH_TYPE(ceph_getcwd, REQ_CMOUNT(), ANS(uint16_t path;));
 

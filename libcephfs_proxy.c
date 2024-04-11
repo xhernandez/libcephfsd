@@ -5,10 +5,20 @@
 #include "proxy_helpers.h"
 #include "proxy_requests.h"
 
+struct Inode {
+    struct Inode *next;
+    uint64_t inode;
+    uint64_t ino;
+    uint32_t refs;
+};
+
 struct ceph_mount_info {
     proxy_link_t link;
     uint64_t cmount;
+    struct Inode *cwd_inode;
+    struct Inode *root_inode;
     bool good;
+    char cwd[PATH_MAX];
 };
 
 static struct ceph_mount_info global_cmount = { .good = false };
@@ -93,6 +103,89 @@ proxy_check(struct ceph_mount_info *cmount, int32_t err, int32_t result)
     return result;
 }
 
+#define INODE_HASH_TABLE_SIZE 65537
+
+static struct Inode *inode_table[INODE_HASH_TABLE_SIZE] = {};
+
+static struct Inode *
+inode_ref(struct Inode *inode)
+{
+    inode->refs++;
+
+    return inode;
+}
+
+static bool
+inode_unref(struct Inode *inode)
+{
+    struct Inode **pinode;
+    uint64_t ino;
+
+    if (--inode->refs > 0) {
+        return false;
+    }
+
+    ino = inode->ino % INODE_HASH_TABLE_SIZE;
+    pinode = &inode_table[ino];
+    while (*pinode != inode) {
+        pinode = &(*pinode)->next;
+    }
+
+    *pinode = inode->next;
+
+    return true;
+}
+
+static struct Inode *
+inode_lookup(uint64_t ino)
+{
+    struct Inode *inode;
+
+    ino %= INODE_HASH_TABLE_SIZE;
+    for (inode = inode_table[ino]; inode != NULL; inode = inode->next) {
+        if (inode->ino == ino) {
+            return inode_ref(inode);
+        }
+    }
+
+    return NULL;
+}
+
+static void
+
+inode_destroy(struct Inode *inode)
+{
+    proxy_free(inode);
+}
+
+static int32_t
+inode_create(struct ceph_mount_info *cmount, struct Inode **pinode,
+             uint64_t ceph_inode, uint64_t ino)
+{
+    struct Inode *inode;
+
+    inode = inode_lookup(ino);
+    if (inode == NULL) {
+        inode = proxy_malloc(sizeof(struct Inode));
+        if (inode == NULL) {
+            ceph_ll_put(cmount, value_ptr(ceph_inode));
+            return -ENOMEM;
+        }
+
+        inode->inode = ceph_inode;
+        inode->ino = ino;
+        inode->refs = 1;
+
+        ino %= INODE_HASH_TABLE_SIZE;
+        inode->next = inode_table[ino];
+        inode_table[ino] = inode;
+    }
+
+    *pinode = inode;
+
+    return 0;
+}
+
 #define CEPH_RUN(_cmount, _op, _req, _ans) \
     ({ \
         int32_t __err = CEPH_CALL((_cmount)->link.sd, _op, _req, _ans); \
@@ -113,11 +206,24 @@ proxy_check(struct ceph_mount_info *cmount, int32_t err, int32_t result)
 __public int
 ceph_chdir(struct ceph_mount_info *cmount, const char *path)
 {
-    CEPH_REQ(ceph_chdir, req, 1, ans, 0);
+    CEPH_REQ(ceph_chdir, req, 1, ans, 1);
+    int32_t err;
 
+    if (strcmp(cmount->cwd, path) == 0) {
+        return 0;
+    }
+
+    req.inode = cmount->cwd_inode == NULL ? 0 : cmount->cwd_inode->inode;
     CEPH_STR_ADD(req, path, path);
 
-    return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_CHDIR, req, ans);
+    CEPH_BUFF_ADD(ans, cmount->cwd, sizeof(cmount->cwd));
+
+    err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_CHDIR, req, ans);
+    if (err >= 0) {
+        cmount->cwd_inode = NULL;
+    }
+
+    return err;
 }
 
 __public int
@@ -183,6 +289,9 @@ ceph_create(struct ceph_mount_info **cmount, const char *const id)
 
     ceph_mount->cmount = ans.cmount;
     ceph_mount->good = true;
+    ceph_mount->cwd_inode = NULL;
+    *ceph_mount->cwd = 0;
+    ceph_mount->root_inode = NULL;
 
     *cmount = ceph_mount;
 
@@ -200,16 +309,18 @@ failed:
 __public const char *
 ceph_getcwd(struct ceph_mount_info *cmount)
 {
-    static char cwd[PATH_MAX];
+    CEPH_REQ(ceph_getcwd, req, 0, ans, 1);
     int32_t err;
 
-    CEPH_REQ(ceph_getcwd, req, 0, ans, 1);
+    if (*cmount->cwd != 0) {
+        return cmount->cwd;
+    }
 
-    CEPH_BUFF_ADD(ans, cwd, sizeof(cwd));
+    CEPH_BUFF_ADD(ans, cmount->cwd, sizeof(cmount->cwd));
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_GETCWD, req, ans);
     if (err >= 0) {
-        return cwd;
+        return cmount->cwd;
     }
 
     errno = -err;
@@ -245,7 +356,7 @@ ceph_ll_create(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     int32_t err;
 
     req.userperm = ptr_value(perms);
-    req.parent = ptr_value(parent);
+    req.parent = parent->inode;
     req.mode = mode;
     req.oflags = oflags;
     req.want = want;
@@ -256,8 +367,11 @@ ceph_ll_create(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_CREATE, req, ans);
     if (err >= 0) {
-        *outp = value_ptr(ans.inode);
-        *fhp = value_ptr(ans.fh);
+        err = inode_create(cmount, outp, ans.inode, stx->stx_ino);
+        /* TODO: leak of ans.fh in case of error */
+        if (err >= 0) {
+            *fhp = value_ptr(ans.fh);
+        }
     }
 
     return err;
@@ -296,7 +410,7 @@ ceph_ll_getattr(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_getattr, req, 0, ans, 1);
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     req.want = want;
     req.flags = flags;
 
@@ -313,7 +427,7 @@ ceph_ll_getxattr(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_getxattr, req, 1, ans, 1);
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     req.size = size;
     CEPH_STR_ADD(req, name, name);
 
@@ -329,8 +443,8 @@ ceph_ll_link(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_link, req, 1, ans, 0);
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
-    req.parent = ptr_value(newparent);
+    req.inode = in->inode;
+    req.parent = newparent->inode;
     CEPH_STR_ADD(req, name, name);
 
     return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LINK, req, ans);
@@ -344,7 +458,7 @@ ceph_ll_listxattr(struct ceph_mount_info *cmount, struct Inode *in, char *list,
     int32_t err;
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     req.size = buf_size;
 
     CEPH_BUFF_ADD(ans, list, buf_size);
@@ -365,8 +479,19 @@ ceph_ll_lookup(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     CEPH_REQ(ceph_ll_lookup, req, 1, ans, 1);
     int32_t err;
 
+    if ((*name == '.') && (name[1] == 0)) {
+        if (cmount->cwd_inode != NULL) {
+            *out = inode_ref(cmount->cwd_inode);
+            memset(stx, 0, sizeof(*stx));
+            stx->stx_ino = cmount->cwd_inode->ino;
+            stx->stx_mask = CEPH_STATX_INO;
+
+            return 0;
+        }
+    }
+
     req.userperm = ptr_value(perms);
-    req.parent = ptr_value(parent);
+    req.parent = parent->inode;
     req.want = want;
     req.flags = flags;
     CEPH_STR_ADD(req, name, name);
@@ -375,7 +500,16 @@ ceph_ll_lookup(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LOOKUP, req, ans);
     if (err >= 0) {
-        *out = value_ptr(ans.inode);
+        err = inode_create(cmount, out, ans.inode, stx->stx_ino);
+        if (err >= 0) {
+            if ((*name == '.') && (name[1] == 0)) {
+                cmount->cwd_inode = inode_ref(*out);
+            }
+            if ((cmount->root_inode == NULL) &&
+                (stx->stx_ino == CEPH_INO_ROOT)) {
+                cmount->root_inode = inode_ref(*out);
+            }
+        }
     }
 
     return err;
@@ -388,11 +522,31 @@ ceph_ll_lookup_inode(struct ceph_mount_info *cmount, struct inodeno_t ino,
     CEPH_REQ(ceph_ll_lookup_inode, req, 0, ans, 0);
     int32_t err;
 
+    if ((ino.val == CEPH_INO_ROOT) && (cmount->root_inode != NULL)) {
+        *inode = inode_ref(cmount->root_inode);
+        return 0;
+    }
+    if ((cmount->cwd_inode != NULL) && (cmount->cwd_inode->ino == ino.val)) {
+        *inode = inode_ref(cmount->cwd_inode);
+        return 0;
+    }
+    *inode = inode_lookup(ino.val);
+    if (*inode != NULL) {
+        return 0;
+    }
+
     req.ino = ino;
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LOOKUP_INODE, req, ans);
     if (err >= 0) {
-        *inode = value_ptr(ans.inode);
+        err = inode_create(cmount, inode, ans.inode, ino.val);
+        if ((err >= 0) && (ino.val == CEPH_INO_ROOT)) {
+            cmount->root_inode = inode_ref(*inode);
+            if ((cmount->cwd_inode == NULL) && (*cmount->cwd == '/') &&
+                (cmount->cwd[1] == 0)) {
+                cmount->cwd_inode = inode_ref(cmount->root_inode);
+            }
+        }
     }
 
     return err;
@@ -404,9 +558,22 @@ ceph_ll_lookup_root(struct ceph_mount_info *cmount, Inode **parent)
     CEPH_REQ(ceph_ll_lookup_root, req, 0, ans, 0);
     int32_t err;
 
+    if (cmount->root_inode != NULL) {
+        *parent = inode_ref(cmount->root_inode);
+        return 0;
+    }
+
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LOOKUP_ROOT, req, ans);
     if (err >= 0) {
-        *parent = value_ptr(ans.inode);
+        err = inode_create(cmount, &cmount->root_inode, ans.inode,
+                           CEPH_INO_ROOT);
+        if (err >= 0) {
+            *parent = inode_ref(cmount->root_inode);
+            if ((cmount->cwd_inode == NULL) && (*cmount->cwd == '/') &&
+                (cmount->cwd[1] == 0)) {
+                cmount->cwd_inode = inode_ref(cmount->root_inode);
+            }
+        }
     }
 
     return err;
@@ -440,7 +607,7 @@ ceph_ll_mkdir(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     int32_t err;
 
     req.userperm = ptr_value(perms);
-    req.parent = ptr_value(parent);
+    req.parent = parent->inode;
     req.mode = mode;
     req.want = want;
     req.flags = flags;
@@ -450,7 +617,7 @@ ceph_ll_mkdir(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_MKDIR, req, ans);
     if (err >= 0) {
-        *out = value_ptr(ans.inode);
+        err = inode_create(cmount, out, ans.inode, stx->stx_ino);
     }
 
     return err;
@@ -465,7 +632,7 @@ ceph_ll_mknod(struct ceph_mount_info *cmount, Inode *parent, const char *name,
     int32_t err;
 
     req.userperm = ptr_value(perms);
-    req.parent = ptr_value(parent);
+    req.parent = parent->inode;
     req.mode = mode;
     req.rdev = rdev;
     req.want = want;
@@ -476,7 +643,7 @@ ceph_ll_mknod(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_MKNOD, req, ans);
     if (err >= 0) {
-        *out = value_ptr(ans.inode);
+        err = inode_create(cmount, out, ans.inode, stx->stx_ino);
     }
 
     return err;
@@ -490,7 +657,7 @@ ceph_ll_open(struct ceph_mount_info *cmount, struct Inode *in, int flags,
     int32_t err;
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     req.flags = flags;
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_OPEN, req, ans);
@@ -509,7 +676,7 @@ ceph_ll_opendir(struct ceph_mount_info *cmount, struct Inode *in,
     int32_t err;
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_OPENDIR, req, ans);
     if (err >= 0) {
@@ -523,10 +690,22 @@ __public int
 ceph_ll_put(struct ceph_mount_info *cmount, struct Inode *in)
 {
     CEPH_REQ(ceph_ll_put, req, 0, ans, 0);
+    int32_t err;
 
-    req.inode = ptr_value(in);
+    if (!inode_unref(in)) {
+        return 0;
+    }
 
-    return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_PUT, req, ans);
+    req.inode = in->inode;
+
+    err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_PUT, req, ans);
+    if (err < 0) {
+        inode_ref(in);
+    } else {
+        inode_destroy(in);
+    }
+
+    return err;
 }
 
 __public int
@@ -551,7 +730,7 @@ ceph_ll_readlink(struct ceph_mount_info *cmount, struct Inode *in, char *buf,
     CEPH_REQ(ceph_ll_readlink, req, 0, ans, 1);
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     req.size = bufsize;
 
     CEPH_BUFF_ADD(ans, buf, bufsize);
@@ -576,7 +755,7 @@ ceph_ll_removexattr(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_removexattr, req, 1, ans, 0);
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     CEPH_STR_ADD(req, name, name);
 
     return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_REMOVEXATTR, req, ans);
@@ -590,8 +769,8 @@ ceph_ll_rename(struct ceph_mount_info *cmount, struct Inode *parent,
     CEPH_REQ(ceph_ll_rename, req, 2, ans, 0);
 
     req.userperm = ptr_value(perms);
-    req.old_parent = ptr_value(parent);
-    req.new_parent = ptr_value(newparent);
+    req.old_parent = parent->inode;
+    req.new_parent = newparent->inode;
     CEPH_STR_ADD(req, old_name, name);
     CEPH_STR_ADD(req, new_name, newname);
 
@@ -615,7 +794,7 @@ ceph_ll_rmdir(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_rmdir, req, 1, ans, 0);
 
     req.userperm = ptr_value(perms);
-    req.parent = ptr_value(in);
+    req.parent = in->inode;
     CEPH_STR_ADD(req, name, name);
 
     return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_RMDIR, req, ans);
@@ -628,7 +807,7 @@ ceph_ll_setattr(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_setattr, req, 1, ans, 0);
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     req.mask = mask;
     CEPH_BUFF_ADD(req, stx, sizeof(*stx));
 
@@ -643,7 +822,7 @@ ceph_ll_setxattr(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_setxattr, req, 2, ans, 0);
 
     req.userperm = ptr_value(perms);
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
     req.size = size;
     req.flags = flags;
     CEPH_STR_ADD(req, name, name);
@@ -658,7 +837,7 @@ ceph_ll_statfs(struct ceph_mount_info *cmount, struct Inode *in,
 {
     CEPH_REQ(ceph_ll_statfs, req, 0, ans, 1);
 
-    req.inode = ptr_value(in);
+    req.inode = in->inode;
 
     CEPH_BUFF_ADD(ans, stbuf, sizeof(*stbuf));
 
@@ -674,7 +853,7 @@ ceph_ll_symlink(struct ceph_mount_info *cmount, Inode *in, const char *name,
     int32_t err;
 
     req.userperm = ptr_value(perms);
-    req.parent = ptr_value(in);
+    req.parent = in->inode;
     req.want = want;
     req.flags = flags;
     CEPH_STR_ADD(req, name, name);
@@ -684,7 +863,7 @@ ceph_ll_symlink(struct ceph_mount_info *cmount, Inode *in, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_SYMLINK, req, ans);
     if (err >= 0) {
-        *out = value_ptr(ans.inode);
+        err = inode_create(cmount, out, ans.inode, stx->stx_ino);
     }
 
     return err;
@@ -697,7 +876,7 @@ ceph_ll_unlink(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_REQ(ceph_ll_unlink, req, 1, ans, 0);
 
     req.userperm = ptr_value(perms);
-    req.parent = ptr_value(in);
+    req.parent = in->inode;
     CEPH_STR_ADD(req, name, name);
 
     return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_UNLINK, req, ans);
@@ -711,6 +890,24 @@ ceph_ll_walk(struct ceph_mount_info *cmount, const char *name, Inode **i,
     CEPH_REQ(ceph_ll_walk, req, 1, ans, 1);
     int32_t err;
 
+    if (cmount->cwd_inode != NULL) {
+        if ((strcmp(cmount->cwd, name) == 0) || ((*name == '.') &&
+            ((name[1] == 0) || ((name[1] == '/') && (name[2] == 0))))) {
+            *i = inode_ref(cmount->cwd_inode);
+            memset(stx, 0, sizeof(*stx));
+            stx->stx_ino = cmount->cwd_inode->ino;
+            stx->stx_mask = CEPH_STATX_INO;
+            return 0;
+        }
+    }
+    if ((cmount->root_inode != NULL) && (*name == '/') && (name[1] == 0)) {
+        *i = inode_ref(cmount->root_inode);
+        memset(stx, 0, sizeof(*stx));
+        stx->stx_ino = CEPH_INO_ROOT;
+        stx->stx_mask = CEPH_STATX_INO;
+        return 0;
+    }
+
     req.userperm = ptr_value(perms);
     req.want = want;
     req.flags = flags;
@@ -720,7 +917,16 @@ ceph_ll_walk(struct ceph_mount_info *cmount, const char *name, Inode **i,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_WALK, req, ans);
     if (err >= 0) {
-        *i = value_ptr(ans.inode);
+        err = inode_create(cmount, i, ans.inode, stx->stx_ino);
+        if (err >= 0) {
+            if ((*name == '.') &&
+                ((name[1] == 0) || ((name[1] == '/') && (name[2] == 0)))) {
+                cmount->cwd_inode = inode_ref(*i);
+            }
+            if ((*name == '/') && (name[1] == 0)) {
+                cmount->root_inode = inode_ref(*i);
+            }
+        }
     }
 
     return err;
@@ -794,8 +1000,25 @@ __public int
 ceph_unmount(struct ceph_mount_info *cmount)
 {
     CEPH_REQ(ceph_unmount, req, 0, ans, 0);
+    int32_t err;
 
-    return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_UNMOUNT, req, ans);
+    req.root_inode = cmount->root_inode == NULL ? 0 : cmount->root_inode->inode;
+    req.cwd_inode = cmount->cwd_inode == NULL ? 0 : cmount->cwd_inode->inode;
+
+    err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_UNMOUNT, req, ans);
+    if (err >= 0) {
+        *cmount->cwd = 0;
+        if (inode_unref(cmount->root_inode)) {
+            inode_destroy(cmount->root_inode);
+        }
+        cmount->root_inode = NULL;
+        if (inode_unref(cmount->cwd_inode)) {
+            inode_destroy(cmount->cwd_inode);
+        }
+        cmount->cwd_inode = NULL;
+    }
+
+    return err;
 }
 
 __public void
