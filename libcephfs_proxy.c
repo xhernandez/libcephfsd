@@ -16,7 +16,13 @@ typedef struct ceph_dentry {
 struct Inode {
     struct ceph_statx stx;
     struct Inode *next;
+    void *dosattrib;
+    void *ntacl;
+    void *posix_acl;
     uint64_t inode;
+    int32_t dosattrib_size;
+    int32_t ntacl_size;
+    int32_t posix_acl_size;
     uint32_t refs;
 };
 
@@ -217,7 +223,7 @@ inode_update(struct Inode *inode, struct ceph_statx *stx)
 
 static int32_t
 inode_create(struct ceph_mount_info *cmount, struct Inode **pinode,
-             uint64_t ceph_inode, struct ceph_statx *stx)
+             uint64_t ceph_inode, struct ceph_statx *stx, bool new)
 {
     struct Inode *inode;
     uint64_t ino;
@@ -240,6 +246,12 @@ inode_create(struct ceph_mount_info *cmount, struct Inode **pinode,
         inode->inode = ceph_inode;
         inode->refs = 1;
         memset(&inode->stx, 0, sizeof(inode->stx));
+        inode->dosattrib = NULL;
+        inode->ntacl = NULL;
+        inode->posix_acl = NULL;
+        inode->dosattrib_size = new ? 0 : -1;
+        inode->ntacl_size = new ? 0 : -1;
+        inode->posix_acl_size = new ? 0 : -1;
 
         ino %= INODE_HASH_TABLE_SIZE;
         inode->next = inode_table[ino];
@@ -255,7 +267,7 @@ inode_create(struct ceph_mount_info *cmount, struct Inode **pinode,
 
 static int32_t
 inode_create_ino(struct ceph_mount_info *cmount, struct Inode **pinode,
-                 uint64_t ceph_inode, uint64_t ino)
+                 uint64_t ceph_inode, uint64_t ino, bool new)
 {
     struct ceph_statx stx;
 
@@ -264,7 +276,7 @@ inode_create_ino(struct ceph_mount_info *cmount, struct Inode **pinode,
     stx.stx_mask = CEPH_STATX_INO;
     stx.stx_ino = ino;
 
-    return inode_create(cmount, pinode, ceph_inode, &stx);
+    return inode_create(cmount, pinode, ceph_inode, &stx, new);
 }
 
 #define MURMUR_SCRAMBLE(_in, _h1, _h2, _c1, _c2, _shift1, _shift2, _mul, _val) \
@@ -586,7 +598,7 @@ ceph_ll_create(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_CREATE, req, ans);
     if (err >= 0) {
-        err = inode_create(cmount, outp, ans.inode, stx);
+        err = inode_create(cmount, outp, ans.inode, stx, true);
         if (err >= 0) {
             err = dentry_create(cmount, parent, *outp, name);
         }
@@ -659,6 +671,51 @@ ceph_ll_getxattr(struct ceph_mount_info *cmount, struct Inode *in,
                  const UserPerm *perms)
 {
     CEPH_REQ(ceph_ll_getxattr, req, 1, ans, 1);
+    int32_t err;
+
+    if (strcmp(name, "user.DOSATTRIB") == 0) {
+        if (in->dosattrib_size >= 0) {
+            if (in->dosattrib == NULL) {
+                return -ENODATA;
+            }
+            if (size > 0) {
+                if (size < in->dosattrib_size) {
+                    return -ERANGE;
+                }
+                memcpy(value, in->dosattrib, in->dosattrib_size);
+            }
+
+            return in->dosattrib_size;
+        }
+    } else if (strcmp(name, "security.NTACL") == 0) {
+        if (in->ntacl_size >= 0) {
+            if (in->ntacl == NULL) {
+                return -ENODATA;
+            }
+            if (size > 0) {
+                if (size < in->ntacl_size) {
+                    return -ERANGE;
+                }
+                memcpy(value, in->ntacl, in->ntacl_size);
+            }
+
+            return in->ntacl_size;
+        }
+    } else if (strcmp(name, "system.posix_acl_access") == 0) {
+        if (in->posix_acl_size >= 0) {
+            if (in->posix_acl == NULL) {
+                return -ENODATA;
+            }
+            if (size > 0) {
+                if (size < in->posix_acl_size) {
+                    return -ERANGE;
+                }
+                memcpy(value, in->posix_acl, in->posix_acl_size);
+            }
+
+            return in->posix_acl_size;
+        }
+    }
 
     req.userperm = ptr_value(perms);
     req.inode = in->inode;
@@ -667,7 +724,26 @@ ceph_ll_getxattr(struct ceph_mount_info *cmount, struct Inode *in,
 
     CEPH_BUFF_ADD(ans, value, size);
 
-    return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_GETXATTR, req, ans);
+    err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_GETXATTR, req, ans);
+    if (strcmp(name, "user.DOSATTRIB") == 0) {
+        if (err >= 0) {
+            in->dosattrib = proxy_malloc(err);
+            memcpy(in->dosattrib, value, err);
+            in->dosattrib_size = err;
+        } else if (err == -ENODATA) {
+            in->dosattrib_size = 0;
+        }
+    } else if (strcmp(name, "security.NTACL") == 0) {
+        if (err >= 0) {
+            in->ntacl = proxy_malloc(err);
+            memcpy(in->ntacl, value, err);
+            in->ntacl_size = err;
+        } else if (err == -ENODATA) {
+            in->ntacl_size = 0;
+        }
+    }
+
+    return err;
 }
 
 __public int
@@ -745,7 +821,7 @@ ceph_ll_lookup(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LOOKUP, req, ans);
     if (err >= 0) {
-        err = inode_create(cmount, out, ans.inode, stx);
+        err = inode_create(cmount, out, ans.inode, stx, false);
         if (err >= 0) {
             err = dentry_create(cmount, parent, *out, name);
         }
@@ -788,7 +864,7 @@ ceph_ll_lookup_inode(struct ceph_mount_info *cmount, struct inodeno_t ino,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LOOKUP_INODE, req, ans);
     if (err >= 0) {
-        err = inode_create_ino(cmount, inode, ans.inode, ino.val);
+        err = inode_create_ino(cmount, inode, ans.inode, ino.val, false);
         if ((err >= 0) && (ino.val == CEPH_INO_ROOT)) {
             cmount->root_inode = inode_ref(*inode);
             if ((cmount->cwd_inode == NULL) && (*cmount->cwd == '/') &&
@@ -815,7 +891,7 @@ ceph_ll_lookup_root(struct ceph_mount_info *cmount, Inode **parent)
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_LOOKUP_ROOT, req, ans);
     if (err >= 0) {
         err = inode_create_ino(cmount, &cmount->root_inode, ans.inode,
-                               CEPH_INO_ROOT);
+                               CEPH_INO_ROOT, false);
         if (err >= 0) {
             *parent = inode_ref(cmount->root_inode);
             if ((cmount->cwd_inode == NULL) && (*cmount->cwd == '/') &&
@@ -866,7 +942,7 @@ ceph_ll_mkdir(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_MKDIR, req, ans);
     if (err >= 0) {
-        err = inode_create(cmount, out, ans.inode, stx);
+        err = inode_create(cmount, out, ans.inode, stx, true);
         if (err >= 0) {
             err = dentry_create(cmount, parent, *out, name);
         }
@@ -895,7 +971,7 @@ ceph_ll_mknod(struct ceph_mount_info *cmount, Inode *parent, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_MKNOD, req, ans);
     if (err >= 0) {
-        err = inode_create(cmount, out, ans.inode, stx);
+        err = inode_create(cmount, out, ans.inode, stx, true);
         if (err >= 0) {
             err = dentry_create(cmount, parent, *out, name);
         }
@@ -1081,6 +1157,7 @@ ceph_ll_setxattr(struct ceph_mount_info *cmount, struct Inode *in,
                  const UserPerm *perms)
 {
     CEPH_REQ(ceph_ll_setxattr, req, 2, ans, 0);
+    int32_t err;
 
     req.userperm = ptr_value(perms);
     req.inode = in->inode;
@@ -1089,7 +1166,33 @@ ceph_ll_setxattr(struct ceph_mount_info *cmount, struct Inode *in,
     CEPH_STR_ADD(req, name, name);
     CEPH_BUFF_ADD(req, value, size);
 
-    return CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_SETXATTR, req, ans);
+    err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_SETXATTR, req, ans);
+    if (err >= 0) {
+        if (strcmp(name, "user.DOSATTRIB") == 0) {
+            if (in->dosattrib != NULL) {
+                proxy_free(in->dosattrib);
+            }
+            in->dosattrib = proxy_malloc(size);
+            memcpy(in->dosattrib, value, size);
+            in->dosattrib_size = size;
+        } else if (strcmp(name, "security.NTACL") == 0) {
+            if (in->ntacl != NULL) {
+                proxy_free(in->ntacl);
+            }
+            in->ntacl = proxy_malloc(size);
+            memcpy(in->ntacl, value, size);
+            in->ntacl_size = size;
+        } else if (strcmp(name, "system.posix_acl_access") == 0) {
+            if (in->posix_acl != NULL) {
+                proxy_free(in->posix_acl);
+            }
+            in->posix_acl = proxy_malloc(size);
+            memcpy(in->posix_acl, value, size);
+            in->posix_acl_size = size;
+        }
+    }
+
+    return err;
 }
 
 __public int
@@ -1124,7 +1227,7 @@ ceph_ll_symlink(struct ceph_mount_info *cmount, Inode *in, const char *name,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_SYMLINK, req, ans);
     if (err >= 0) {
-        err = inode_create(cmount, out, ans.inode, stx);
+        err = inode_create(cmount, out, ans.inode, stx, true);
         if (err >= 0) {
             err = dentry_create(cmount, in, *out, name);
         }
@@ -1179,7 +1282,7 @@ ceph_ll_walk(struct ceph_mount_info *cmount, const char *name, Inode **i,
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_LL_WALK, req, ans);
     if (err >= 0) {
-        err = inode_create(cmount, i, ans.inode, stx);
+        err = inode_create(cmount, i, ans.inode, stx, false);
         if (err >= 0) {
             if ((*name == '.') &&
                 ((name[1] == 0) || ((name[1] == '/') && (name[2] == 0)))) {
