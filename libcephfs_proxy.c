@@ -24,6 +24,7 @@ struct Inode {
     int32_t ntacl_size;
     int32_t posix_acl_size;
     uint32_t refs;
+    bool new;
 };
 
 struct ceph_mount_info {
@@ -252,6 +253,7 @@ inode_create(struct ceph_mount_info *cmount, struct Inode **pinode,
         inode->dosattrib_size = new ? 0 : -1;
         inode->ntacl_size = new ? 0 : -1;
         inode->posix_acl_size = new ? 0 : -1;
+        inode->new = new;
 
         ino %= INODE_HASH_TABLE_SIZE;
         inode->next = inode_table[ino];
@@ -809,6 +811,9 @@ ceph_ll_lookup(struct ceph_mount_info *cmount, Inode *parent, const char *name,
         memcpy(stx, &dentry->inode->stx, sizeof(*stx));
 
         return 0;
+    }
+    if (parent->new) {
+        return -ENOENT;
     }
 
     req.userperm = ptr_value(perms);
