@@ -803,11 +803,9 @@ libcephfsd_getcwd(proxy_client_t *client, proxy_req_t *req, const void *data,
 
     if (err >= 0) {
         path = ceph_getcwd(cmount);
-        TRACE("ceph_getcwd(%p) -> '%s'", cmount, path);
-
-        if (path == NULL) {
-            err = -errno;
-        } else {
+        err = -errno;
+        TRACE("ceph_getcwd(%p) -> '%s' (%d)", cmount, path, -err);
+        if (path != NULL) {
             CEPH_STR_ADD(ans, path, path);
             err = 0;
         }
@@ -833,10 +831,9 @@ libcephfsd_readdir(proxy_client_t *client, proxy_req_t *req, const void *data,
 
     if (err >= 0) {
         de = ceph_readdir(cmount, dirp);
-        TRACE("ceph_readdir(%p, %p) -> %p", cmount, dirp, de);
-        if (de == NULL) {
-            err = -errno;
-        } else {
+        err = -errno;
+        TRACE("ceph_readdir(%p, %p) -> %p (%d)", cmount, dirp, de, -err);
+        if (de != NULL) {
             CEPH_BUFF_ADD(ans, de,
                           offset_of(struct dirent, d_name) +
                               strlen(de->d_name) + 1);
@@ -1077,12 +1074,11 @@ libcephfsd_ll_lseek(proxy_client_t *client, proxy_req_t *req, const void *data,
         whence = req->ll_lseek.whence;
 
         pos = ceph_ll_lseek(cmount, fh, offset, whence);
-        TRACE("ceph_ll_lseek(%p, %p, %ld, %d) -> %ld", cmount, fh, offset,
-              whence, pos);
+        err = -errno;
+        TRACE("ceph_ll_lseek(%p, %p, %ld, %d) -> %ld (%d)", cmount, fh, offset,
+              whence, pos, -err);
 
-        if (pos < 0) {
-            err = -errno;
-        } else {
+        if (pos >= 0) {
             ans.offset = pos;
             err = 0;
         }
