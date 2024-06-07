@@ -832,14 +832,15 @@ libcephfsd_readdir(proxy_client_t *client, proxy_req_t *req, const void *data,
     }
 
     if (err >= 0) {
+        errno = 0;
         de = ceph_readdir(cmount, dirp);
         err = -errno;
         TRACE("ceph_readdir(%p, %p) -> %p (%d)", cmount, dirp, de, -err);
+        ans.eod = de == NULL;
         if (de != NULL) {
             CEPH_BUFF_ADD(ans, de,
                           offset_of(struct dirent, d_name) +
                               strlen(de->d_name) + 1);
-            err = 0;
         }
     }
 

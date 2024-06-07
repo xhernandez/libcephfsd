@@ -763,13 +763,14 @@ ceph_readdir(struct ceph_mount_info *cmount, struct ceph_dir_result *dirp)
     CEPH_BUFF_ADD(ans, &de, sizeof(de));
 
     err = CEPH_PROCESS(cmount, LIBCEPHFSD_OP_READDIR, req, ans);
-    if (err >= 0) {
-        return &de;
+    if (err < 0) {
+        errno = -err;
+    }
+    if (ans.eod) {
+        return NULL;
     }
 
-    errno = -err;
-
-    return NULL;
+    return &de;
 }
 
 __public int

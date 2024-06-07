@@ -227,7 +227,7 @@ CEPH_TYPE(ceph_chdir, REQ_CMOUNT(uint16_t path;), ANS());
 
 CEPH_TYPE(ceph_getcwd, REQ_CMOUNT(), ANS(uint16_t path;));
 
-CEPH_TYPE(ceph_readdir, REQ_CMOUNT(uint64_t dir;), ANS());
+CEPH_TYPE(ceph_readdir, REQ_CMOUNT(uint64_t dir;), ANS(bool eod;));
 
 CEPH_TYPE(ceph_rewinddir, REQ_CMOUNT(uint64_t dir;), ANS());
 
