@@ -377,10 +377,12 @@ libcephfsd_userperm_new(proxy_client_t *client, proxy_req_t *req,
     TRACE("ceph_userperm_new(%u, %u, %u) -> %p", req->userperm_new.uid,
           req->userperm_new.gid, req->userperm_new.groups, userperm);
 
-    if (userperm == NULL) {
-        err = -ENOMEM;
-    } else {
+    err = -ENOMEM;
+    if (userperm != NULL) {
         err = ptr_checksum(&global_random, userperm, &ans.userperm);
+        if (err < 0) {
+            ceph_userperm_destroy(userperm);
+        }
     }
 
     return CEPH_COMPLETE(client, err, ans);
