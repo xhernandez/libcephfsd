@@ -28,11 +28,13 @@ random_u64(void)
     uint64_t value;
     int32_t i;
 
-    value = 0;
-    for (i = 0; i < 4; i++) {
-        value <<= 16;
-        value ^= (random() >> 8) & 0xffff;
-    }
+    do {
+        value = 0;
+        for (i = 0; i < 4; i++) {
+            value <<= 16;
+            value ^= (random() >> 8) & 0xffff;
+        }
+    } while (value == 0);
 
     return value;
 }
