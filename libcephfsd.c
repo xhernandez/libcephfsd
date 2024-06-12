@@ -399,10 +399,10 @@ libcephfsd_userperm_destroy(proxy_client_t *client, proxy_req_t *req,
 
     err = ptr_check(&global_random, req->userperm_destroy.userperm,
                     (void **)&perms);
-    TRACE("ceph_userperm_destroy(%p) -> %d", perms, err);
 
     if (err >= 0) {
         ceph_userperm_destroy(perms);
+        TRACE("ceph_userperm_destroy(%p)", perms);
     }
 
     return CEPH_COMPLETE(client, err, ans);
