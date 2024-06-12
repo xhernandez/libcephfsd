@@ -5,21 +5,28 @@
 
 #include <cephfs/libcephfs.h>
 
-#define CHECK(_func, _args...) \
+#define CHECK(_err, _func, _args...) \
     do { \
-        int32_t __err = _func(_args); \
-        printf("#### " #_func "() -> %d\n", __err); \
-        if (__err < 0) { \
-            printf(#_func "() failed: (%d) %s\n", -__err, strerror(-__err)); \
+        if (_err >= 0) { \
+            _err = _func(_args); \
+            printf("#### " #_func "() -> %d\n", _err); \
+            if (_err < 0) { \
+                printf(#_func "() failed: (%d) %s\n", -_err, strerror(-_err)); \
+            } \
         } \
     } while (0)
 
-#define CHECK_PTR(_func, _args...) \
+#define CHECK_PTR(_err, _func, _args...) \
     ({ \
-        void *__ptr = _func(_args); \
-        printf("#### " #_func "() -> %p\n", __ptr); \
-        if (__ptr == NULL) { \
-            printf(#_func "() failed: (%d) %s\n", errno, strerror(errno)); \
+        void *__ptr = NULL; \
+        if (_err >= 0) { \
+            __ptr = _func(_args); \
+            _err = errno; \
+            printf("#### " #_func "() -> %p\n", __ptr); \
+            if (__ptr == NULL) { \
+                printf(#_func "() failed: (%d) %s\n", _err, strerror(_err)); \
+                _err = -_err; \
+            } \
         } \
         __ptr; \
     })
@@ -107,40 +114,50 @@ main(int32_t argc, char *argv[])
     struct Fh *fh;
     int32_t err, major, minor, patch;
 
+    if (argc < 3) {
+        printf("Usage: libcephfsd_test <id> <config file> [<fs>]\n");
+        return 1;
+    }
+
     proxy_log_register(&log_handler, log_write);
 
     text = ceph_version(&major, &minor, &patch);
     printf("%d.%d.%d (%s)\n", major, minor, patch, text);
 
-    err = ceph_create(&cmount, "sit");
+    err = 0;
+    CHECK(err, ceph_create, &cmount, argv[1]);
+    CHECK(err, ceph_conf_read_file, cmount, argv[2]);
+    CHECK(err, ceph_conf_get, cmount, "log file", data, sizeof(data));
+    CHECK(err, ceph_conf_set, cmount, "client_acl_type", "posix_acl");
+    CHECK(err, ceph_conf_get, cmount, "client_acl_type", data, sizeof(data));
+    CHECK(err, ceph_conf_set, cmount, "fuse_default_permissions", "false");
+    CHECK(err, ceph_init, cmount);
+    CHECK(err, ceph_select_filesystem, cmount, "sit_fs");
+    CHECK(err, ceph_mount, cmount, NULL);
+    perms = CHECK_PTR(err, ceph_userperm_new, 0, 0, 0, NULL);
+    CHECK(err, ceph_ll_lookup_root, cmount, &root);
+    CHECK(err, ceph_ll_mkdir, cmount, root, "dir.1", 0755, &dir, &stx,
+                              CEPH_STATX_INO, 0, perms);
     if (err >= 0) {
-        CHECK(ceph_conf_read_file, cmount, "/etc/ceph/sit.ceph.conf");
-        CHECK(ceph_conf_get, cmount, "log file", data, sizeof(data));
-        CHECK(ceph_conf_set, cmount, "client_acl_type", "posix_acl");
-        CHECK(ceph_conf_get, cmount, "client_acl_type", data, sizeof(data));
-        CHECK(ceph_conf_set, cmount, "fuse_default_permissions", "false");
-        CHECK(ceph_init, cmount);
-        CHECK(ceph_select_filesystem, cmount, "sit_fs");
-        CHECK(ceph_mount, cmount, NULL);
-        perms = CHECK_PTR(ceph_userperm_new, 0, 0, 0, NULL);
-        CHECK(ceph_ll_lookup_root, cmount, &root);
-        CHECK(ceph_ll_mkdir, cmount, root, "dir.1", 0755, &dir, &stx,
-                             CEPH_STATX_INO, 0, perms);
         show_statx("dir.1", &stx);
-        CHECK(ceph_ll_create, cmount, dir, "file.1", 0644,
-                              O_CREAT | O_TRUNC | O_RDWR, &file, &fh, &stx, 0,
-                              0, perms);
-        show_statx("file.1", &stx);
-        CHECK(ceph_ll_write, cmount, fh, 0, sizeof(stx), (char *)&stx);
-        memset(&stx, 0, sizeof(stx));
-        CHECK(ceph_ll_read, cmount, fh, 0, sizeof(stx), (char *)&stx);
-        show_statx("file.1", &stx);
-        CHECK(ceph_ll_close, cmount, fh);
-        CHECK(ceph_ll_unlink, cmount, dir, "file.1", perms);
-        CHECK(ceph_ll_rmdir, cmount, root, "dir.1", perms);
-        CHECK(ceph_unmount, cmount);
-        CHECK(ceph_release, cmount);
     }
+    CHECK(err, ceph_ll_create, cmount, dir, "file.1", 0644,
+                               O_CREAT | O_TRUNC | O_RDWR, &file, &fh, &stx, 0,
+                               0, perms);
+    if (err >= 0) {
+        show_statx("file.1", &stx);
+    }
+    CHECK(err, ceph_ll_write, cmount, fh, 0, sizeof(stx), (char *)&stx);
+    memset(&stx, 0, sizeof(stx));
+    CHECK(err, ceph_ll_read, cmount, fh, 0, sizeof(stx), (char *)&stx);
+    if (err >= 0) {
+        show_statx("file.1", &stx);
+    }
+    CHECK(err, ceph_ll_close, cmount, fh);
+    CHECK(err, ceph_ll_unlink, cmount, dir, "file.1", perms);
+    CHECK(err, ceph_ll_rmdir, cmount, root, "dir.1", perms);
+    CHECK(err, ceph_unmount, cmount);
+    CHECK(err, ceph_release, cmount);
 
     proxy_log_deregister(&log_handler);
 
