@@ -1104,6 +1104,8 @@ libcephfsd_ll_read(proxy_client_t *client, proxy_req_t *req, const void *data,
     uint32_t size;
     int32_t err;
 
+    buffer = client->buffer;
+
     err = ptr_check(&client->random, req->ll_read.cmount, (void **)&mount);
     if (err >= 0) {
         err = ptr_check(&client->random, req->ll_read.fh, (void **)&fh);
@@ -1112,7 +1114,6 @@ libcephfsd_ll_read(proxy_client_t *client, proxy_req_t *req, const void *data,
         offset = req->ll_read.offset;
         len = req->ll_read.len;
 
-        buffer = client->buffer;
         size = client->buffer_size;
         if (len > size) {
             buffer = proxy_malloc(size);
