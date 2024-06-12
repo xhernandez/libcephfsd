@@ -513,12 +513,11 @@ proxy_instance_init(proxy_instance_t *instance)
         return 0;
     }
 
-    err = ceph_init(instance->cmount);
-    if (err < 0) {
-        return proxy_log(LOG_ERR, -err, "ceph_init() failed");
-    }
-
-    instance->inited = true;
+    /* ceph_init() does start several internal threads. However, an instance
+     * may not end up being mounted if the configuration matches with another
+     * mounted instance. Since ceph_mount() also calls ceph_init() if not
+     * already done, we avoid initilizing it here to reduce resource
+     * consumption. */
 
     return 0;
 }
