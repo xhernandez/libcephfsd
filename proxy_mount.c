@@ -306,6 +306,7 @@ proxy_instance_change_add(proxy_instance_t *instance, const char *arg1,
     if (change == NULL) {
         return -ENOMEM;
     }
+    change->size = total;
 
     memcpy(change->data, arg1, len[0]);
     memcpy(change->data + len[0], arg2, len[1]);
@@ -441,7 +442,8 @@ proxy_instance_option_get(proxy_instance_t *instance, const char *name,
 
     res = ceph_conf_get(instance->cmount, name, value, size);
     if (res < 0) {
-        return res;
+        return proxy_log(LOG_ERR, -res,
+                         "Failed to get configuration from a client instance");
     }
 
     err = proxy_instance_change_add(instance, "get", name, value);
@@ -470,6 +472,7 @@ proxy_instance_option_set(proxy_instance_t *instance, const char *name,
 
     err = ceph_conf_set(instance->cmount, name, value);
     if (err < 0) {
+        proxy_log(LOG_ERR, -err, "Failed to configure a client instance");
         proxy_instance_change_del(instance);
     }
 
@@ -493,6 +496,8 @@ proxy_instance_select(proxy_instance_t *instance, const char *fs)
 
     err = ceph_select_filesystem(instance->cmount, fs);
     if (err < 0) {
+        proxy_log(LOG_ERR, -err,
+                  "Failed to select a filesystem on a client instance");
         proxy_instance_change_del(instance);
     }
 
