@@ -2,6 +2,8 @@
 #ifndef __LIBCEPHFSD_PROXY_H__
 #define __LIBCEPHFSD_PROXY_H__
 
+#define _GNU_SOURCE
+
 #include <string.h>
 #include <errno.h>
 #include <stdarg.h>

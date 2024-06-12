@@ -268,4 +268,12 @@ proxy_signal_set(int32_t signum, struct sigaction *action,
     return 0;
 }
 
+int32_t
+proxy_hash(uint8_t *hash, size_t size,
+           int32_t (*feed)(void **, void *, int32_t), void *data);
+
+int32_t
+proxy_hash_hex(char *digest, size_t size,
+               int32_t (*feed)(void **, void *, int32_t), void *data);
+
 #endif

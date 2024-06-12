@@ -5,6 +5,8 @@ sources += proxy_log.c
 
 proxy_sources := libcephfsd.c
 proxy_sources += proxy_manager.c
+proxy_sources += proxy_mount.c
+proxy_sources += proxy_helpers.c
 proxy_sources += $(sources)
 
 lib_sources := libcephfs_proxy.c
@@ -12,8 +14,11 @@ lib_sources += $(sources)
 
 test_sources := libcephfsd_test.c
 
-#CFLAGS := -Wall -O0 -g -D_FILE_OFFSET_BITS=64
-CFLAGS := -Wall -O3 -flto -D_FILE_OFFSET_BITS=64
+DAEMON_LIBS := -lcrypto -lcephfs
+PROXY_LIBS :=
+
+CFLAGS := -Wall -O0 -g -D_FILE_OFFSET_BITS=64
+#CFLAGS := -Wall -O3 -flto -D_FILE_OFFSET_BITS=64
 
 .PHONY: all
 all:			libcephfsd libcephfsd_test
@@ -23,13 +28,13 @@ install:		all
 			cp -f libcephfs_proxy.so /usr/lib64/
 
 libcephfsd:		$(proxy_sources:.c=.o)
-			gcc $(CFLAGS) -o $@ $^ -lcephfs
+			gcc $(CFLAGS) -o $@ $^ $(DAEMON_LIBS)
 
 libcephfsd_test:	$(test_sources:.c=.o) libcephfs_proxy.so
 			gcc $(CFLAGS) -L. -o $@ $(test_sources:.c=.o) -lcephfs_proxy
 
 libcephfs_proxy.so:	$(lib_sources:.c=.so.o)
-			gcc $(CFLAGS) -fvisibility=hidden -shared -fPIC -o $@ $^
+			gcc $(CFLAGS) -fvisibility=hidden -shared -fPIC -o $@ $^ $(PROXY_LIBS)
 
 %.so.o:			%.c Makefile
 			gcc $(CFLAGS) -fvisibility=hidden -c -fPIC -o $@ $<
