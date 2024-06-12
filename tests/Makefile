@@ -1,5 +1,6 @@
 
 tests := basic
+tests += share_instances
 
 CFLAGS := -Wall -O0 -g -D_FILE_OFFSET_BITS=64
 #CFLAGS := -Wall -O3 -flto -D_FILE_OFFSET_BITS=64
