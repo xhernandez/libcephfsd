@@ -27,6 +27,8 @@ typedef struct _proxy_client {
     proxy_link_t *link;
     pthread_mutex_t log_mutex;
     proxy_random_t random;
+    void *buffer;
+    uint32_t buffer_size;
     int32_t sd;
 } proxy_client_t;
 
@@ -43,8 +45,6 @@ typedef struct _client_command {
 
 typedef int32_t (*proxy_handler_t)(proxy_client_t *, proxy_req_t *,
                                    const void *data, int32_t data_size);
-
-static __thread char recv_buffer[1048576 * 4];
 
 static proxy_random_t global_random;
 
@@ -474,25 +474,25 @@ libcephfsd_conf_get(proxy_client_t *client, proxy_req_t *req, const void *data,
     CEPH_DATA(ceph_conf_get, ans, 1);
     proxy_mount_t *mount;
     const char *option;
+    void *buffer;
+    uint32_t size;
     int32_t err;
 
-    err = 0;
-    if (req->conf_get.size > sizeof(recv_buffer)) {
-        err = proxy_log(LOG_ERR, EINVAL, "Option buffer too large");
+    buffer = client->buffer;
+    size = client->buffer_size;
+    if (req->conf_get.size < size) {
+        size = req->conf_get.size;
     }
-    if (err >= 0) {
-        err = ptr_check(&client->random, req->conf_get.cmount,
-                        (void **)&mount);
-    }
+    err = ptr_check(&client->random, req->conf_get.cmount, (void **)&mount);
     if (err >= 0) {
         option = CEPH_STR_GET(req->conf_get, option, data);
 
-        err = proxy_mount_get(mount, option, recv_buffer, req->conf_get.size);
-        TRACE("ceph_conf_get(%p, '%s', '%s') -> %d", mount, option, recv_buffer,
-              err);
+        err = proxy_mount_get(mount, option, buffer, size);
+        TRACE("ceph_conf_get(%p, '%s', '%s') -> %d", mount, option,
+              (char *)buffer, err);
 
         if (err >= 0) {
-            CEPH_DATA_ADD(ans, value, recv_buffer, strlen(recv_buffer) + 1);
+            CEPH_DATA_ADD(ans, value, buffer, strlen(buffer) + 1);
         }
     }
 
@@ -1098,8 +1098,10 @@ libcephfsd_ll_read(proxy_client_t *client, proxy_req_t *req, const void *data,
     CEPH_DATA(ceph_ll_read, ans, 1);
     proxy_mount_t *mount;
     struct Fh *fh;
+    void *buffer;
     uint64_t len;
     int64_t offset;
+    uint32_t size;
     int32_t err;
 
     err = ptr_check(&client->random, req->ll_read.cmount, (void **)&mount);
@@ -1110,21 +1112,32 @@ libcephfsd_ll_read(proxy_client_t *client, proxy_req_t *req, const void *data,
         offset = req->ll_read.offset;
         len = req->ll_read.len;
 
-        if (len > sizeof(recv_buffer)) {
-            err = proxy_log(LOG_ERR, ENOBUFS, "Attempt to read too much data");
-        } else {
-            err = ceph_ll_read(proxy_cmount(mount), fh, offset, len,
-                               recv_buffer);
+        buffer = client->buffer;
+        size = client->buffer_size;
+        if (len > size) {
+            buffer = proxy_malloc(size);
+            if (buffer == NULL) {
+                err = -ENOMEM;
+            }
+        }
+        if (err >= 0) {
+            err = ceph_ll_read(proxy_cmount(mount), fh, offset, len, buffer);
             TRACE("ceph_ll_read(%p, %p, %ld, %lu) -> %d", mount, fh, offset,
                   len, err);
 
             if (err >= 0) {
-                CEPH_BUFF_ADD(ans, recv_buffer, err);
+                CEPH_BUFF_ADD(ans, buffer, err);
             }
         }
     }
 
-    return CEPH_COMPLETE(client, err, ans);
+    err = CEPH_COMPLETE(client, err, ans);
+
+    if (buffer != client->buffer) {
+        proxy_free(buffer);
+    }
+
+    return err;
 }
 
 static int32_t
@@ -1357,19 +1370,17 @@ libcephfsd_ll_listxattr(proxy_client_t *client, proxy_req_t *req,
     }
     if (err >= 0) {
         size = req->ll_listxattr.size;
+        if (size > client->buffer_size) {
+            size = client->buffer_size;
+        }
+        err = ceph_ll_listxattr(proxy_cmount(mount), inode, client->buffer,
+                                size, &size, perms);
+        TRACE("ceph_ll_listxattr(%p, %p, %lu, %p) -> %d", mount, inode, size,
+              perms, err);
 
-        if (size > sizeof(recv_buffer)) {
-            err = proxy_log(LOG_ERR, ENOBUFS, "Attempt to read too much data");
-        } else {
-            err = ceph_ll_listxattr(proxy_cmount(mount), inode, recv_buffer,
-                                    size, &size, perms);
-            TRACE("ceph_ll_listxattr(%p, %p, %lu, %p) -> %d", mount, inode,
-                  size, perms, err);
-
-            if (err >= 0) {
-                ans.size = size;
-                CEPH_BUFF_ADD(ans, recv_buffer, size);
-            }
+        if (err >= 0) {
+            ans.size = size;
+            CEPH_BUFF_ADD(ans, client->buffer, size);
         }
     }
 
@@ -1401,17 +1412,16 @@ libcephfsd_ll_getxattr(proxy_client_t *client, proxy_req_t *req,
         size = req->ll_getxattr.size;
         name = CEPH_STR_GET(req->ll_getxattr, name, data);
 
-        if (size > sizeof(recv_buffer)) {
-            err = proxy_log(LOG_ERR, ENOBUFS, "Attempt to read too much data");
-        } else {
-            err = ceph_ll_getxattr(proxy_cmount(mount), inode, name, recv_buffer,
-                                   size, perms);
-            TRACE("ceph_ll_getxattr(%p, %p, '%s', %p) -> %d", mount, inode,
-                  name, perms, err);
+        if (size > client->buffer_size) {
+            size = client->buffer_size;
+        }
+        err = ceph_ll_getxattr(proxy_cmount(mount), inode, name, client->buffer,
+                                size, perms);
+        TRACE("ceph_ll_getxattr(%p, %p, '%s', %p) -> %d", mount, inode, name,
+              perms, err);
 
-            if (err >= 0) {
-                CEPH_BUFF_ADD(ans, recv_buffer, err);
-            }
+        if (err >= 0) {
+            CEPH_BUFF_ADD(ans, client->buffer, err);
         }
     }
 
@@ -1509,14 +1519,13 @@ libcephfsd_ll_readlink(proxy_client_t *client, proxy_req_t *req,
     if (err >= 0) {
         size = req->ll_readlink.size;
 
-        if (size > sizeof(recv_buffer)) {
-            err = proxy_log(LOG_ERR, ENOBUFS, "Attempt to read too much data");
-        } else {
-            err = ceph_ll_readlink(proxy_cmount(mount), inode, recv_buffer,
-                                   size, perms);
-            TRACE("ceph_ll_readlink(%p, %p, %p) -> %d", mount, inode, perms,
-                  err);
+        if (size > client->buffer_size) {
+            size = client->buffer_size;
         }
+        err = ceph_ll_readlink(proxy_cmount(mount), inode, client->buffer,
+                                size, perms);
+        TRACE("ceph_ll_readlink(%p, %p, %p) -> %d", mount, inode, perms,
+                err);
     }
 
     return CEPH_COMPLETE(client, err, ans);
@@ -1818,40 +1827,53 @@ serve_binary(proxy_client_t *client)
     proxy_req_t req;
     CEPH_DATA(hello, ans, 0);
     struct iovec req_iov[2];
+    void *buffer;
+    uint32_t size;
     int32_t err;
+
+    size = 65536;
+    buffer = proxy_malloc(size);
+    if (buffer == NULL) {
+        return;
+    }
 
     ans.major = LIBCEPHFSD_MAJOR;
     ans.minor = LIBCEPHFSD_MINOR;
     err = proxy_link_send(client->sd, ans_iov, ans_count);
     if (err < 0) {
+        proxy_free(buffer);
         return;
     }
 
     while (true) {
         req_iov[0].iov_base = &req;
         req_iov[0].iov_len = sizeof(req);
-        req_iov[1].iov_base = recv_buffer;
-        req_iov[1].iov_len = sizeof(recv_buffer);
+        req_iov[1].iov_base = buffer;
+        req_iov[1].iov_len = size;
 
         err = proxy_link_req_recv(client->sd, req_iov, 2);
-        if (err <= 0) {
-            break;
+        if (err > 0) {
+            if (req.header.op >= LIBCEPHFSD_OP_TOTAL_OPS) {
+                err = send_error(client, -ENOSYS);
+            } else if (libcephfsd_handlers[req.header.op] == NULL) {
+                err = send_error(client, -EOPNOTSUPP);
+            } else {
+                err = libcephfsd_handlers[req.header.op](client, &req,
+                                                         req_iov[1].iov_base,
+                                                         req.header.data_len);
+            }
         }
 
-        if (req.header.op >= LIBCEPHFSD_OP_TOTAL_OPS) {
-            err = send_error(client, -ENOSYS);
-        } else if (libcephfsd_handlers[req.header.op] == NULL) {
-            err = send_error(client, -EOPNOTSUPP);
-        } else {
-//            printf("$$$$ Serving request %d\n", req.header.op);
-            err = libcephfsd_handlers[req.header.op](client, &req, recv_buffer,
-                                                     req.header.data_len);
+        if (req_iov[1].iov_base != buffer) {
+            proxy_free(req_iov[1].iov_base);
         }
 
         if (err < 0) {
             break;
         }
     }
+
+    proxy_free(buffer);
 }
 
 static void
@@ -1884,6 +1906,7 @@ destroy_connection(proxy_worker_t *worker)
 
     client = container_of(worker, proxy_client_t, worker);
 
+    proxy_free(client->buffer);
     proxy_free(client);
 }
 
@@ -1902,6 +1925,13 @@ accept_connection(proxy_link_t *link, int32_t sd)
         goto failed_close;
     }
 
+    client->buffer_size = 65536;
+    client->buffer = proxy_malloc(client->buffer_size);
+    if (client->buffer == NULL) {
+        err = -ENOMEM;
+        goto failed_client;
+    }
+
     random_init(&client->random);
     client->sd = sd;
     client->link = link;
@@ -1909,12 +1939,15 @@ accept_connection(proxy_link_t *link, int32_t sd)
     err = proxy_manager_launch(server->manager, &client->worker,
                                serve_connection, destroy_connection);
     if (err < 0) {
-        goto failed_memory;
+        goto failed_buffer;
     }
 
     return 0;
 
-failed_memory:
+failed_buffer:
+    proxy_free(client->buffer);
+
+failed_client:
     proxy_free(client);
 
 failed_close:

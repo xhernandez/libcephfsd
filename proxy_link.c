@@ -353,6 +353,7 @@ int32_t
 proxy_link_req_recv(int32_t sd, struct iovec *iov, int32_t count)
 {
     proxy_link_req_t *req;
+    void *buffer;
     int32_t err, len, total;
 
     len = iov->iov_len;
@@ -366,8 +367,15 @@ proxy_link_req_recv(int32_t sd, struct iovec *iov, int32_t count)
     req = iov->iov_base;
 
     if (req->data_len > 0) {
-        if ((count == 1) || (iov[1].iov_len < req->data_len)) {
+        if (count == 1) {
             return proxy_log(LOG_ERR, ENOBUFS, "Request data is too long");
+        }
+        if (iov[1].iov_len < req->data_len) {
+            buffer = proxy_malloc(req->data_len);
+            if (buffer == NULL) {
+                return -ENOMEM;
+            }
+            iov[1].iov_base = buffer;
         }
         iov[1].iov_len = req->data_len;
     } else {
