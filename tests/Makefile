@@ -12,8 +12,8 @@ all:			$(tests)
 %.o:			%.c Makefile
 			gcc $(CFLAGS) -I.. -c -o $@ $<
 
-%:			%.o Makefile
-			gcc $(CFALGS) -L.. -o $@ $< -lcephfs_proxy
+%:			%.o test_common.o Makefile
+			gcc $(CFALGS) -L.. -o $@ $< test_common.o -lcephfs_proxy
 
 .PHONY:	clean
 clean:
