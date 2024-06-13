@@ -285,27 +285,36 @@ uint64_checksum(uint64_t value)
     return value & 0xff;
 }
 
-static int32_t
-ptr_checksum(proxy_random_t *rnd, void *ptr, uint64_t *pvalue)
+static uint64_t
+ptr_checksum(proxy_random_t *rnd, void *ptr)
 {
     uint64_t value;
 
     if (ptr == NULL) {
-        *pvalue = 0;
         return 0;
     }
 
     value = (uint64_t)(uintptr_t)ptr;
+    /* Many current processors don't use the full 64-bits for the virtual
+     * address space, and Linux assigns the lower 128 TiB (47 bits) for
+     * user-space applications on most architectures, so the highest 8 bits
+     * of all valid addressess are always 0.
+     *
+     * We use this to encode a checksum in the high byte of the address to
+     * be able to do a verification before dereferencing the pointer, avoiding
+     * crashes if the client passes an invalid or corrupted pointer value.
+     *
+     * Alternatives like using indexes in a table or registering valid pointers
+     * require access to a shared data structure that will require thread
+     * synchronization, making it slower. */
     if ((value & 0xff00000000000007ULL) != 0) {
-        proxy_log(LOG_ERR, EIO, "Unexpected pointer value");
-        return -EIO;
+        proxy_log(LOG_ERR, EINVAL, "Unexpected or corrupted pointer value");
+        abort();
     }
 
     value -= uint64_checksum(value) << 56;
 
-    *pvalue = random_scramble(rnd, value);
-
-    return 0;
+    return random_scramble(rnd, value);
 }
 
 static int32_t
@@ -380,10 +389,7 @@ libcephfsd_userperm_new(proxy_client_t *client, proxy_req_t *req,
 
     err = -ENOMEM;
     if (userperm != NULL) {
-        err = ptr_checksum(&global_random, userperm, &ans.userperm);
-        if (err < 0) {
-            ceph_userperm_destroy(userperm);
-        }
+        ans.userperm = ptr_checksum(&global_random, userperm);
     }
 
     return CEPH_COMPLETE(client, err, ans);
@@ -423,7 +429,7 @@ libcephfsd_create(proxy_client_t *client, proxy_req_t *req, const void *data,
     TRACE("ceph_create(%p, '%s') -> %d", mount, id, err);
 
     if (err >= 0) {
-        err = ptr_checksum(&client->random, mount, &ans.cmount);
+        ans.cmount = ptr_checksum(&client->random, mount);
     }
 
     return CEPH_COMPLETE(client, err, ans);
@@ -662,7 +668,7 @@ libcephfsd_ll_lookup(proxy_client_t *client, proxy_req_t *req, const void *data,
               parent, name, out, want, flags, perms, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, out, &ans.inode);
+            ans.inode = ptr_checksum(&client->random, out);
         }
     }
 
@@ -689,7 +695,7 @@ libcephfsd_ll_lookup_inode(proxy_client_t *client, proxy_req_t *req,
               err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, inode, &ans.inode);
+            ans.inode = ptr_checksum(&client->random, inode);
         }
     }
 
@@ -712,7 +718,7 @@ libcephfsd_ll_lookup_root(proxy_client_t *client, proxy_req_t *req,
         TRACE("ceph_ll_lookup_root(%p, %p) -> %d", mount, inode, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, inode, &ans.inode);
+            ans.inode = ptr_checksum(&client->random, inode);
         }
     }
 
@@ -771,7 +777,7 @@ libcephfsd_ll_walk(proxy_client_t *client, proxy_req_t *req, const void *data,
               inode, want, flags, perms, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, inode, &ans.inode);
+            ans.inode = ptr_checksum(&client->random, inode);
         }
     }
 
@@ -901,7 +907,7 @@ libcephfsd_ll_open(proxy_client_t *client, proxy_req_t *req, const void *data,
               fh, perms, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, fh, &ans.fh);
+            ans.fh = ptr_checksum(&client->random, fh);
         }
     }
 
@@ -948,10 +954,8 @@ libcephfsd_ll_create(proxy_client_t *client, proxy_req_t *req, const void *data,
               err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, fh, &ans.fh);
-            if (err >= 0) {
-                err = ptr_checksum(&client->random, inode, &ans.inode);
-            }
+            ans.fh = ptr_checksum(&client->random, fh);
+            ans.inode = ptr_checksum(&client->random, inode);
         }
     }
 
@@ -997,7 +1001,7 @@ libcephfsd_ll_mknod(proxy_client_t *client, proxy_req_t *req, const void *data,
               mount, parent, name, mode, rdev, inode, want, flags, perms, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, inode, &ans.inode);
+            ans.inode = ptr_checksum(&client->random, inode);
         }
     }
 
@@ -1573,7 +1577,7 @@ libcephfsd_ll_symlink(proxy_client_t *client, proxy_req_t *req,
               mount, parent, name, value, inode, want, flags, perms, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, inode, &ans.inode);
+            ans.inode = ptr_checksum(&client->random, inode);
         }
     }
 
@@ -1607,7 +1611,7 @@ libcephfsd_ll_opendir(proxy_client_t *client, proxy_req_t *req,
               perms, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, dirp, &ans.dir);
+            ans.dir = ptr_checksum(&client->random, dirp);
         }
     }
 
@@ -1651,7 +1655,7 @@ libcephfsd_ll_mkdir(proxy_client_t *client, proxy_req_t *req, const void *data,
               parent, name, mode, inode, want, flags, perms, err);
 
         if (err >= 0) {
-            err = ptr_checksum(&client->random, inode, &ans.inode);
+            ans.inode = ptr_checksum(&client->random, inode);
         }
     }
 
