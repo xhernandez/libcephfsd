@@ -651,6 +651,11 @@ libcephfsd_ll_lookup(proxy_client_t *client, proxy_req_t *req, const void *data,
 
         CEPH_BUFF_ADD(ans, &stx, sizeof(stx));
 
+        // Forbid going outside of the root mount point
+        if ((parent == mount->root) && (strcmp(name, "..") == 0)) {
+            name =".";
+        }
+
         err = ceph_ll_lookup(proxy_cmount(mount), parent, name, &out, &stx,
                              want, flags, perms);
         TRACE("ceph_ll_lookup(%p, %p, '%s', %p, %x, %x, %p) -> %d", mount,
