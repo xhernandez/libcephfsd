@@ -20,6 +20,7 @@ typedef struct _proxy_instance {
 typedef struct _proxy_mount {
     proxy_instance_t *instance;
     struct Inode *root;
+    uint64_t root_ino;
 } proxy_mount_t;
 
 static inline struct ceph_mount_info *

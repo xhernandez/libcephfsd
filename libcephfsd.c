@@ -707,6 +707,7 @@ libcephfsd_ll_lookup_root(proxy_client_t *client, proxy_req_t *req,
                           const void *data, int32_t data_size)
 {
     CEPH_DATA(ceph_ll_lookup_root, ans, 0);
+    struct inodeno_t ino;
     proxy_mount_t *mount;
     struct Inode *inode;
     int32_t err;
@@ -714,10 +715,21 @@ libcephfsd_ll_lookup_root(proxy_client_t *client, proxy_req_t *req,
     err = ptr_check(&client->random, req->ll_lookup_root.cmount,
                     (void **)&mount);
     if (err >= 0) {
-        err = ceph_ll_lookup_root(proxy_cmount(mount), &inode);
+        /* The libcephfs view of the root of the mount could be different than
+         * ours, so we can't rely on ceph_ll_lookup_root(). We fake it by
+         * returning the cached root inode at the time of mount. However there's
+         * no way to tell libcephfs to increase the reference counter of the
+         * inode, so we do a full lookup for now. */
+        ino.val = mount->root_ino;
+        inode = mount->root;
+        err = ceph_ll_lookup_inode(proxy_cmount(mount), ino, &inode);
         TRACE("ceph_ll_lookup_root(%p, %p) -> %d", mount, inode, err);
 
         if (err >= 0) {
+            if (inode != mount->root) {
+                proxy_log(LOG_WARN, 0, "Root inode changed");
+            }
+
             ans.inode = ptr_checksum(&client->random, inode);
         }
     }

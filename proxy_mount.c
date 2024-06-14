@@ -731,6 +731,7 @@ proxy_mount_mount(proxy_mount_t *mount, const char *root)
     }
 
     mount->root = inode;
+    mount->root_ino = stx.stx_ino;
 
     return 0;
 }
@@ -741,6 +742,7 @@ proxy_mount_unmount(proxy_mount_t *mount)
     if (mount->root != NULL) {
         ceph_ll_forget(mount->instance->cmount, mount->root, 1);
         mount->root = NULL;
+        mount->root_ino = 0;
     }
 
     return proxy_instance_unmount(&mount->instance);
