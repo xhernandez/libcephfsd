@@ -99,10 +99,39 @@ proxy_malloc(size_t size)
     return ptr;
 }
 
+static inline int32_t
+proxy_realloc(void **pptr, size_t size)
+{
+    void *ptr;
+
+    ptr = realloc(*pptr, size);
+    if (ptr == NULL) {
+        return proxy_log(LOG_ERR, errno, "Failed to reallocate memory");
+    }
+
+    *pptr = ptr;
+
+    return 0;
+}
+
 static inline void
 proxy_free(void *ptr)
 {
     free(ptr);
+}
+
+static inline char *
+proxy_strdup(const char *str)
+{
+    char *ptr;
+
+    ptr = strdup(str);
+    if (ptr == NULL) {
+        proxy_log(LOG_ERR, errno, "Failed to copy a string");
+        return NULL;
+    }
+
+    return ptr;
 }
 
 static inline int32_t

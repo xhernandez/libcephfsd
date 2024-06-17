@@ -659,7 +659,7 @@ libcephfsd_ll_lookup(proxy_client_t *client, proxy_req_t *req, const void *data,
 
         // Forbid going outside of the root mount point
         if ((parent == mount->root) && (strcmp(name, "..") == 0)) {
-            name =".";
+            name = ".";
         }
 
         err = ceph_ll_lookup(proxy_cmount(mount), parent, name, &out, &stx,
@@ -707,9 +707,7 @@ libcephfsd_ll_lookup_root(proxy_client_t *client, proxy_req_t *req,
                           const void *data, int32_t data_size)
 {
     CEPH_DATA(ceph_ll_lookup_root, ans, 0);
-    struct inodeno_t ino;
     proxy_mount_t *mount;
-    struct Inode *inode;
     int32_t err;
 
     err = ptr_check(&client->random, req->ll_lookup_root.cmount,
@@ -717,20 +715,12 @@ libcephfsd_ll_lookup_root(proxy_client_t *client, proxy_req_t *req,
     if (err >= 0) {
         /* The libcephfs view of the root of the mount could be different than
          * ours, so we can't rely on ceph_ll_lookup_root(). We fake it by
-         * returning the cached root inode at the time of mount. However there's
-         * no way to tell libcephfs to increase the reference counter of the
-         * inode, so we do a full lookup for now. */
-        ino.val = mount->root_ino;
-        inode = mount->root;
-        err = ceph_ll_lookup_inode(proxy_cmount(mount), ino, &inode);
-        TRACE("ceph_ll_lookup_root(%p, %p) -> %d", mount, inode, err);
+         * returning the cached root inode at the time of mount. */
+        err = proxy_inode_ref(mount, mount->root_ino);
+        TRACE("ceph_ll_lookup_root(%p, %p) -> %d", mount, mount->root, err);
 
         if (err >= 0) {
-            if (inode != mount->root) {
-                proxy_log(LOG_WARN, 0, "Root inode changed");
-            }
-
-            ans.inode = ptr_checksum(&client->random, inode);
+            ans.inode = ptr_checksum(&client->random, mount->root);
         }
     }
 
@@ -783,8 +773,8 @@ libcephfsd_ll_walk(proxy_client_t *client, proxy_req_t *req, const void *data,
 
         CEPH_BUFF_ADD(ans, &stx, sizeof(stx));
 
-        err = ceph_ll_walk(proxy_cmount(mount), path, &inode, &stx, want, flags,
-                           perms);
+        err = proxy_path_resolve(mount, path, &inode, &stx, want, flags, perms,
+                                 NULL);
         TRACE("ceph_ll_walk(%p, '%s', %p, %x, %x, %p) -> %d", mount, path,
               inode, want, flags, perms, err);
 
@@ -801,16 +791,34 @@ libcephfsd_chdir(proxy_client_t *client, proxy_req_t *req, const void *data,
                  int32_t data_size)
 {
     CEPH_DATA(ceph_chdir, ans, 0);
+    struct ceph_statx stx;
     proxy_mount_t *mount;
+    struct Inode *inode;
     const char *path;
+    char *realpath;
     int32_t err;
 
     err = ptr_check(&client->random, req->chdir.cmount, (void **)&mount);
     if (err >= 0) {
         path = CEPH_STR_GET(req->chdir, path, data);
 
-        err = ceph_chdir(proxy_cmount(mount), path);
+        /* Since the libcephfs mount may be shared, we can't really change the
+         * current directory to avoid interferences with other users, so we just
+         * lookup the new directory and keep an internal reference. */
+        err = proxy_path_resolve(mount, path, &inode, &stx, CEPH_STATX_INO, 0,
+                                 mount->perms, &realpath);
         TRACE("ceph_chdir(%p, '%s') -> %d", mount, path, err);
+        if (err >= 0) {
+            ceph_ll_put(proxy_cmount(mount), mount->cwd);
+            mount->cwd = inode;
+            mount->cwd_ino = stx.stx_ino;
+
+            /* TODO: This path may become outdated if the parent directories are
+             *       moved, however this seems the best we can do for now. */
+            proxy_free(mount->cwd_path);
+            mount->cwd_path = realpath;
+            mount->cwd_path_len = strlen(realpath);
+        }
     }
 
     return CEPH_COMPLETE(client, err, ans);
@@ -828,13 +836,11 @@ libcephfsd_getcwd(proxy_client_t *client, proxy_req_t *req, const void *data,
     err = ptr_check(&client->random, req->getcwd.cmount, (void **)&mount);
 
     if (err >= 0) {
-        path = ceph_getcwd(proxy_cmount(mount));
-        err = -errno;
+        /* We just return the cached name from the last chdir(). */
+        path = mount->cwd_path;
         TRACE("ceph_getcwd(%p) -> '%s' (%d)", mount, path, -err);
-        if (path != NULL) {
-            CEPH_STR_ADD(ans, path, path);
-            err = 0;
-        }
+        CEPH_STR_ADD(ans, path, path);
+        err = 0;
     }
 
     return CEPH_COMPLETE(client, err, ans);
