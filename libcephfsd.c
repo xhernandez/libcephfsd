@@ -390,6 +390,7 @@ libcephfsd_userperm_new(proxy_client_t *client, proxy_req_t *req,
     err = -ENOMEM;
     if (userperm != NULL) {
         ans.userperm = ptr_checksum(&global_random, userperm);
+        err = 0;
     }
 
     return CEPH_COMPLETE(client, err, ans);

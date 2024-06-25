@@ -30,10 +30,9 @@ typedef struct _proxy_path_iterator {
     uint64_t base_ino;
     uint32_t realpath_size;
     uint32_t realpath_len;
-    uint32_t want;
-    uint32_t flags;
     uint32_t symlinks;
     bool release;
+    bool follow;
 } proxy_path_iterator_t;
 
 typedef struct _proxy_config {
@@ -182,8 +181,8 @@ proxy_linked_str_scan(proxy_linked_str_t *lstr, char ch)
 
 static int32_t
 proxy_path_iterator_init(proxy_path_iterator_t *iter, proxy_mount_t *mount,
-                         const char *path, uint32_t want, uint32_t flags,
-                         UserPerm *perms, bool realpath)
+                         const char *path, UserPerm *perms, bool realpath,
+                         bool follow)
 {
     uint32_t len;
     char ch;
@@ -195,14 +194,24 @@ proxy_path_iterator_init(proxy_path_iterator_t *iter, proxy_mount_t *mount,
     iter->root_ino = mount->root_ino;
     iter->base = mount->cwd;
     iter->base_ino = mount->cwd_ino;
-    iter->want = want | CEPH_STATX_INO | CEPH_STATX_MODE;
-    iter->flags = flags;
     iter->symlinks = 0;
     iter->release = false;
+    iter->follow = follow;
+
+    len = strlen(path) + 1;
+
+    ch = *path;
+    if (ch == '/') {
+        iter->base = mount->root;
+        iter->base_ino = mount->root_ino;
+        path++;
+    }
+
+    iter->realpath = NULL;
+    iter->realpath_len = 0;
+    iter->realpath_size = 0;
 
     if (realpath) {
-        len = strlen(path) + 1;
-        ch = *path;
         if (ch != '/') {
             len += mount->cwd_path_len;
         }
@@ -215,19 +224,14 @@ proxy_path_iterator_init(proxy_path_iterator_t *iter, proxy_mount_t *mount,
         }
         iter->realpath_len = 0;
         if (ch == '/') {
-            iter->base = mount->root;
-            path++;
             memcpy(iter->realpath, mount->cwd_path, mount->cwd_path_len);
             iter->realpath_len = mount->cwd_path_len;
         }
-    } else {
-        iter->realpath = NULL;
-        iter->realpath_len = 0;
-        iter->realpath_size = 0;
     }
 
     iter->lstr = proxy_linked_str_create(path, NULL);
     if (iter->lstr == NULL) {
+        proxy_free(iter->realpath);
         return -ENOMEM;
     }
 
@@ -349,27 +353,37 @@ proxy_path_iterator_remove(proxy_path_iterator_t *iter)
 }
 
 static int32_t
+proxy_path_lookup(struct ceph_mount_info *cmount, struct Inode *parent,
+                  const char *name, struct Inode **inode,
+                  struct ceph_statx *stx, uint32_t want, uint32_t flags,
+                  UserPerm *perms)
+{
+    int32_t err;
+
+    err = ceph_ll_lookup(cmount, parent, name, inode, stx, want,
+                         flags, perms);
+    if (err < 0) {
+        return proxy_log(LOG_ERR, -err, "ceph_ll_lookup() failed");
+    }
+
+    return err;
+}
+
+static int32_t
 proxy_path_iterator_lookup(proxy_path_iterator_t *iter, const char *name)
 {
     struct Inode *inode;
-    uint32_t want;
     int32_t err;
-    bool last;
 
     if (S_ISLNK(iter->stx.stx_mode)) {
         return proxy_path_iterator_resolve(iter);
     }
 
-    last = proxy_path_iterator_is_last(iter);
-    want = CEPH_STATX_INO | CEPH_STATX_MODE;
-    if (last) {
-        want |= iter->want;
-    }
-
-    err = ceph_ll_lookup(iter->cmount, iter->base, name, &inode, &iter->stx,
-                         want, AT_SYMLINK_NOFOLLOW, iter->perms);
+    err = proxy_path_lookup(iter->cmount, iter->base, name, &inode, &iter->stx,
+                            CEPH_STATX_INO | CEPH_STATX_MODE,
+                            AT_SYMLINK_NOFOLLOW, iter->perms);
     if (err < 0) {
-        return proxy_log(LOG_ERR, -err, "ceph_ll_lookup() failed");
+        return err;
     }
 
     if (iter->realpath != NULL) {
@@ -391,8 +405,8 @@ proxy_path_iterator_lookup(proxy_path_iterator_t *iter, const char *name)
     iter->base_ino = iter->stx.stx_ino;
     iter->release = true;
 
-    if (last && ((iter->flags & AT_SYMLINK_NOFOLLOW) == 0) &&
-        S_ISLNK(iter->stx.stx_mode)) {
+    if (iter->follow && S_ISLNK(iter->stx.stx_mode) &&
+        proxy_path_iterator_is_last(iter)) {
         return proxy_path_iterator_resolve(iter);
     }
 
@@ -408,8 +422,8 @@ proxy_path_resolve(proxy_mount_t *mount, const char *path, struct Inode **inode,
     char *name, c;
     int32_t err;
 
-    err = proxy_path_iterator_init(&iter, mount, path, want, flags, perms,
-                                   realpath != NULL);
+    err = proxy_path_iterator_init(&iter, mount, path, perms, realpath != NULL,
+                                   (flags & AT_SYMLINK_NOFOLLOW) == 0);
     while ((err >= 0) &&
            ((name = proxy_path_iterator_next(&iter)) != NULL)) {
         c = *name;
@@ -427,25 +441,15 @@ proxy_path_resolve(proxy_mount_t *mount, const char *path, struct Inode **inode,
     }
 
     if (err >= 0) {
-        if (!iter.release) {
-            /* iter.base is mount->root or mount->cwd, so we need to take a new
-             * reference to the inode before returning. */
-            err = proxy_inode_ref(mount, iter.base_ino);
-            if (err < 0) {
-                goto done;
-            }
-        }
-        iter.release = false;
-        *inode = iter.base;
-        memcpy(stx, &iter.stx, sizeof(*stx));
-
-        if (realpath != NULL) {
-            *realpath = iter.realpath;
-            iter.realpath = NULL;
-        }
+        err = proxy_path_lookup(proxy_cmount(mount), iter.base, ".", inode, stx,
+                                want, flags, iter.perms);
     }
 
-done:
+    if ((err >= 0) && (realpath != NULL)) {
+        *realpath = iter.realpath;
+        iter.realpath = NULL;
+    }
+
     proxy_path_iterator_destroy(&iter);
 
     return err;
